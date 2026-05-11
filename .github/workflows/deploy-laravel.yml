@@ -1,0 +1,332 @@
+name: Laravel CI/CD to Bluehost
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          extensions: mbstring, bcmath, pdo_mysql, sqlite, pdo_sqlite, xml, ctype, fileinfo, tokenizer, dom, curl, gd, zip
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install Composer dependencies
+        run: composer install --no-interaction --prefer-dist --no-progress
+
+      - name: Prepare app env for CI
+        run: |
+          cp .env.example .env
+          touch database/database.sqlite
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Build frontend assets
+        run: npm run build
+
+      - name: Run tests
+        env:
+          APP_ENV: testing
+          APP_KEY: base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+          DB_CONNECTION: sqlite
+          DB_DATABASE: database/database.sqlite
+          CACHE_STORE: array
+          SESSION_DRIVER: array
+          QUEUE_CONNECTION: sync
+        run: php artisan test
+
+      - name: Build deploy package
+        run: |
+          mkdir -p deploy-package
+          rsync -av ./ deploy-package/ \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='node_modules' \
+            --exclude='vendor' \
+            --exclude='tests' \
+            --exclude='.env' \
+            --exclude='public/hot' \
+            --exclude='storage/logs' \
+            --exclude='storage/framework/cache/data'
+
+      - name: Upload deploy artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: laravel-deploy-package
+          path: deploy-package/
+          if-no-files-found: error
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: ci
+
+    steps:
+      - name: Download deploy artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: laravel-deploy-package
+          path: deploy-package
+
+      - name: Start SSH agent
+        uses: webfactory/ssh-agent@v0.9.1
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Deploy to remote via rsync
+        env:
+          HOST: ${{ secrets.REMOTE_HOST }}
+          USER: ${{ secrets.REMOTE_USER }}
+          PORT: ${{ secrets.REMOTE_PORT }}
+          REMOTE_PATH: ${{ secrets.REMOTE_PATH }}
+          REMOTE_APP_PATH: ${{ secrets.REMOTE_APP_PATH }}
+          DEPLOY_PRUNE: ${{ secrets.DEPLOY_PRUNE }}
+        run: |
+          REMOTE_PORT=${PORT:-22}
+          APP_PATH=${REMOTE_APP_PATH:-${REMOTE_PATH}}
+          PRUNE=${DEPLOY_PRUNE:-false}
+          DELETE_FLAG=''
+
+          if [ "${PRUNE}" = "true" ]; then
+            DELETE_FLAG='--delete'
+          fi
+
+          if [ -z "${APP_PATH}" ]; then
+            echo "REMOTE_APP_PATH or REMOTE_PATH must be set in repository secrets."
+            exit 1
+          fi
+
+          # Incremental deploy by default: only changed files transfer.
+          # Set DEPLOY_PRUNE=true to also remove files deleted from git.
+          rsync -avz --checksum ${DELETE_FLAG} \
+            --exclude='.env' \
+            --exclude='storage/app/public' \
+            --exclude='storage/logs' \
+            --exclude='storage/framework/cache/data' \
+            -e "ssh -p ${REMOTE_PORT} -o StrictHostKeyChecking=no" \
+            deploy-package/ ${USER}@${HOST}:${APP_PATH}
+
+      - name: Run remote Laravel deploy commands
+        env:
+          HOST: ${{ secrets.REMOTE_HOST }}
+          USER: ${{ secrets.REMOTE_USER }}
+          PORT: ${{ secrets.REMOTE_PORT }}
+          REMOTE_PATH: ${{ secrets.REMOTE_PATH }}
+          REMOTE_APP_PATH: ${{ secrets.REMOTE_APP_PATH }}
+          REMOTE_WEB_PATH: ${{ secrets.REMOTE_WEB_PATH }}
+          REMOTE_PHP: ${{ secrets.REMOTE_PHP }}
+          DEPLOY_PRUNE: ${{ secrets.DEPLOY_PRUNE }}
+        run: |
+          REMOTE_PORT=${PORT:-22}
+          PHP_BIN=${REMOTE_PHP:-php}
+          APP_PATH=${REMOTE_APP_PATH:-${REMOTE_PATH}}
+          WEB_PATH=${REMOTE_WEB_PATH:-${APP_PATH}/public}
+
+          if [ -z "${APP_PATH}" ]; then
+            echo "REMOTE_APP_PATH or REMOTE_PATH must be set in repository secrets."
+            exit 1
+          fi
+
+          ssh -p "${REMOTE_PORT}" -o StrictHostKeyChecking=no "${USER}@${HOST}" "
+            set -e
+            APP_PATH='${APP_PATH}'
+            WEB_PATH='${WEB_PATH}'
+            PHP_BIN='${PHP_BIN}'
+            PRUNE='${DEPLOY_PRUNE:-false}'
+
+            on_error() {
+              echo 'Remote deploy failed. Last Laravel log lines:'
+              if [ -f \"\$APP_PATH/storage/logs/laravel.log\" ]; then
+                tail -n 120 \"\$APP_PATH/storage/logs/laravel.log\"
+              else
+                echo 'No laravel.log found yet.'
+              fi
+            }
+            trap on_error ERR
+
+            cd \"\$APP_PATH\"
+
+            if [ ! -f .env ]; then
+              if [ -f .env.example ]; then
+                cp .env.example .env
+              else
+                printf '%s\\n' \\
+                  'APP_NAME=Laravel' \\
+                  'APP_ENV=production' \\
+                  'APP_KEY=' \\
+                  'APP_DEBUG=false' \\
+                  'APP_URL=https://localhost' \\
+                  'ASSET_PATH_PREFIX=public' \\
+                  '' \\
+                  'LOG_CHANNEL=stack' \\
+                  'LOG_LEVEL=error' \\
+                  '' \\
+                  'CACHE_STORE=file' \\
+                  'SESSION_DRIVER=file' \\
+                  'QUEUE_CONNECTION=sync' \\
+                  > .env
+              fi
+            fi
+
+            if command -v composer >/dev/null 2>&1; then
+              composer install --no-dev --prefer-dist --no-interaction --optimize-autoloader
+            else
+              \"\$PHP_BIN\" -r \"copy('https://getcomposer.org/installer', 'composer-setup.php');\"
+              \"\$PHP_BIN\" composer-setup.php --filename=composer.phar
+              \"\$PHP_BIN\" composer.phar install --no-dev --prefer-dist --no-interaction --optimize-autoloader
+            fi
+
+            # Ensure runtime writable directories exist and are writable on shared hosting.
+            mkdir -p storage/framework/cache/data storage/framework/sessions storage/framework/views storage/logs bootstrap/cache
+            chmod -R ug+rw storage bootstrap/cache || true
+
+            # Prevent 500 caused by missing APP_KEY on first deploy.
+            if ! grep -q '^APP_KEY=' .env; then
+              echo 'APP_KEY=' >> .env
+            fi
+            if grep -Eq '^APP_KEY=\s*$' .env; then
+              \"\$PHP_BIN\" artisan key:generate --force
+            fi
+
+            # Shared-hosting URL fix: generate asset() links as /public/*.
+            if grep -q '^ASSET_PATH_PREFIX=' .env; then
+              sed -i 's#^ASSET_PATH_PREFIX=.*#ASSET_PATH_PREFIX=public#' .env
+            else
+              echo 'ASSET_PATH_PREFIX=public' >> .env
+            fi
+
+            \"\$PHP_BIN\" artisan migrate --force
+            \"\$PHP_BIN\" artisan optimize:clear
+            \"\$PHP_BIN\" artisan config:cache
+            \"\$PHP_BIN\" artisan route:cache
+            \"\$PHP_BIN\" artisan view:cache
+
+            # Force production to use built assets by removing Vite hot markers.
+            rm -f "\$APP_PATH/public/hot" "\$WEB_PATH/hot" "\$APP_PATH/hot"
+
+            # Publish Laravel public entrypoint to the actual web root.
+            mkdir -p \"\$WEB_PATH\"
+            RSYNC_DELETE_FLAG=''
+            if [ "\$PRUNE" = 'true' ]; then
+              RSYNC_DELETE_FLAG='--delete'
+            fi
+            rsync -av \$RSYNC_DELETE_FLAG public/ \"\$WEB_PATH/\"
+
+            # Frontend safety: ensure built Vite assets are physically present where web server reads from.
+            if [ ! -f "\$APP_PATH/public/build/manifest.json" ]; then
+              echo 'Error: public/build/manifest.json not found on remote app path.'
+              exit 1
+            fi
+
+            mkdir -p "\$WEB_PATH/build" "\$APP_PATH/build"
+            rsync -av --delete "\$APP_PATH/public/build/" "\$WEB_PATH/build/"
+            rsync -av --delete "\$APP_PATH/public/build/" "\$APP_PATH/build/"
+            chmod -R a+rX "\$WEB_PATH/build" "\$APP_PATH/public/build" "\$APP_PATH/build" || true
+
+            # Ensure web root index points to app path when web root is separated.
+            printf '%s\\n' \\
+              '<?php' \\
+              '' \\
+              'use Illuminate\\Foundation\\Application;' \\
+              'use Illuminate\\Http\\Request;' \\
+              '' \\
+              \"define('LARAVEL_START', microtime(true));\" \\
+              '' \\
+              \"if (file_exists('\$APP_PATH/storage/framework/maintenance.php')) {\" \\
+              \"    require '\$APP_PATH/storage/framework/maintenance.php';\" \\
+              '}' \\
+              '' \\
+              \"require '\$APP_PATH/vendor/autoload.php';\" \\
+              '' \\
+              '/** @var Application \\\$app */' \\
+              \"\\\$app = require_once '\$APP_PATH/bootstrap/app.php';\" \\
+              '' \\
+              '\$app->handleRequest(Request::capture());' \\
+              > \"\$WEB_PATH/index.php\"
+
+            # Keep public uploads reachable from the web root.
+            rm -rf \"\$WEB_PATH/storage\"
+            ln -sfn "\$APP_PATH/storage/app/public" "\$WEB_PATH/storage" || {
+              mkdir -p "\$WEB_PATH/storage"
+              rsync -av "\$APP_PATH/storage/app/public/" "\$WEB_PATH/storage/"
+            }
+
+            # Ensure Vite/static paths also work when docroot points to APP_PATH.
+            # Blade @vite emits /build/... so expose that at APP_PATH too.
+            rm -rf "\$APP_PATH/build" "\$APP_PATH/images"
+            ln -sfn "\$APP_PATH/public/build" "\$APP_PATH/build" || {
+              mkdir -p "\$APP_PATH/build"
+              rsync -av "\$APP_PATH/public/build/" "\$APP_PATH/build/"
+            }
+            ln -sfn "\$APP_PATH/public/images" "\$APP_PATH/images" || {
+              mkdir -p "\$APP_PATH/images"
+              rsync -av "\$APP_PATH/public/images/" "\$APP_PATH/images/"
+            }
+
+            if [ ! -f "\$WEB_PATH/build/manifest.json" ] && [ ! -f "\$APP_PATH/build/manifest.json" ]; then
+              echo 'Error: build manifest is missing from both web and app fallback paths.'
+              exit 1
+            fi
+
+            # Fallback for shared hosting where docroot accidentally points to APP_PATH.
+            # This prevents Apache directory listing and still boots Laravel correctly.
+            printf '%s\\n' \\
+              '<?php' \\
+              '' \\
+              'use Illuminate\\Foundation\\Application;' \\
+              'use Illuminate\\Http\\Request;' \\
+              '' \\
+              \"define('LARAVEL_START', microtime(true));\" \\
+              '' \\
+              \"if (file_exists('\$APP_PATH/storage/framework/maintenance.php')) {\" \\
+              \"    require '\$APP_PATH/storage/framework/maintenance.php';\" \\
+              '}' \\
+              '' \\
+              \"require '\$APP_PATH/vendor/autoload.php';\" \\
+              '' \\
+              '/** @var Application \\\$app */' \\
+              \"\\\$app = require_once '\$APP_PATH/bootstrap/app.php';\" \\
+              '' \\
+              '\$app->handleRequest(Request::capture());' \\
+              > "\$APP_PATH/index.php"
+
+            printf '%s\\n' \\
+              'Options -Indexes' \\
+              '' \\
+              '<IfModule mod_rewrite.c>' \\
+              '    RewriteEngine On' \\
+              '' \\
+              '    # Serve frontend and uploaded assets from public/ when docroot points to app root.' \\
+              '    RewriteRule ^storage/(.*)$ public/storage/$1 [L,NC]' \\
+              '    RewriteRule ^build/(.*)$ public/build/$1 [L,NC]' \\
+              '    RewriteRule ^images/(.*)$ public/images/$1 [L,NC]' \\
+              '' \\
+              '    # Block direct web access to framework internals if docroot points to app root.' \\
+              '    RewriteRule ^(app|bootstrap|config|database|resources|routes|storage|tests|vendor)(/|$) - [F,L,NC]' \\
+              '    RewriteRule ^(artisan|composer\.(json|lock)|package(-lock)?\.json|phpunit\.xml|vite\.config\.js|tailwind\.config\.js|postcss\.config\.js|\.env)$ - [F,L,NC]' \\
+              '' \\
+              '    RewriteCond %{REQUEST_FILENAME} !-f' \\
+              '    RewriteCond %{REQUEST_FILENAME} !-d' \\
+              '    RewriteRule ^ index.php [L]' \\
+              '</IfModule>' \\
+              > "\$APP_PATH/.htaccess"
+
+          "
